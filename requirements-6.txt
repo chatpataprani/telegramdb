@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+pyarrow
+huggingface_hub
