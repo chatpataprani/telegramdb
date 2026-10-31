@@ -60,18 +60,6 @@ def _clean(value):
     return value
 
 
-def _mask_phone(value):
-    """Do not expose complete phone numbers through this public API."""
-    value = _clean(value)
-    if not value:
-        return None
-
-    digits = "".join(ch for ch in value if ch.isdigit())
-    if len(digits) <= 2:
-        return "*" * len(digits)
-    return "*" * (len(digits) - 2) + digits[-2:]
-
-
 def _scan_candidate_fragments(telegram_id):
     filter_expr = ds.field("account_id") == telegram_id
 
@@ -97,7 +85,7 @@ def _scan_candidate_fragments(telegram_id):
                 if account_id == telegram_id:
                     return {
                         "account_id": account_id,
-                        "phone": _mask_phone(row.get("phone")),
+                        "phone": _clean(row.get("phone")),
                     }
 
     return None
@@ -152,7 +140,7 @@ def root():
         "backend": "FastAPI + PyArrow row-group pruning + Hugging Face",
         "data_files": len(DATA_FILES),
         "cache_size": CACHE_SIZE,
-        "phone_output": "masked",
+        "phone_output": "full",
         "api_version": app.version,
     }
 
