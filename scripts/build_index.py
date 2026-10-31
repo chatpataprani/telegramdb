@@ -28,6 +28,7 @@ shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
 shutil.rmtree(TEMP_DIR, ignore_errors=True)
 OUTPUT_DIR.mkdir(parents=True)
 TEMP_DIR.mkdir(parents=True)
+(TEMP_DIR / "spill").mkdir(parents=True)
 
 print(f"Listing source Parquet files in {BUCKET_PATH}", flush=True)
 fs = HfFileSystem(token=TOKEN)
