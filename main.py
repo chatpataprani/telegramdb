@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from functools import lru_cache
@@ -12,6 +13,7 @@ BUCKET = os.getenv(
 )
 HF_TOKEN = os.getenv("HF_TOKEN") or None
 DEVELOPER = "chatpataprani"
+logger = logging.getLogger("telegramdb")
 CACHE_SIZE = max(1, int(os.getenv("CACHE_SIZE", "1024")))
 BATCH_SIZE = max(256, int(os.getenv("BATCH_SIZE", "4096")))
 
@@ -108,7 +110,8 @@ def lookup_telegram_id(telegram_id):
     try:
         found = _lookup_cached(telegram_id)
     except Exception as exc:
-        # Avoid silently turning storage/scan failures into false not_found.
+        # Keep the client response generic, but record the real cause in Vercel logs.
+        logger.exception("Parquet lookup failed (exception_type=%s)", type(exc).__name__)
         raise HTTPException(
             status_code=503,
             detail="Database scan temporarily failed. Please retry.",
