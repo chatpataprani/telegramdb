@@ -70,7 +70,7 @@ def _scan_candidate_fragments(telegram_id):
     # that causes many repeated HTTP range requests to Hugging Face.
     candidate_files = []
     for fragment in FRAGMENTS:
-        if next(fragment.split_by_row_group(filter=filter_expr), None) is not None:
+        if fragment.split_by_row_group(filter=filter_expr):
             candidate_files.append(fragment)
 
     # Scan each candidate Parquet file once. PyArrow applies the exact filter
