@@ -2,6 +2,12 @@ name: Build Telegram lookup index
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/build_index.py"
+      - ".github/workflows/build-index.yml"
 
 permissions:
   contents: read
