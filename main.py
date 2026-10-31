@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -16,41 +17,63 @@ DEVELOPER = "chatpataprani"
 logger = logging.getLogger("telegramdb")
 CACHE_SIZE = max(1, int(os.getenv("CACHE_SIZE", "1024")))
 BATCH_SIZE = max(256, int(os.getenv("BATCH_SIZE", "4096")))
+INDEX_DIR = os.getenv("INDEX_DIR", "telegram-index")
+INDEX_SHARDS = max(1, int(os.getenv("INDEX_SHARDS", "1024")))
+INDEX_MANIFEST = f"{BUCKET}/{INDEX_DIR}/manifest.json"
 
 app = FastAPI(
     title="Telegram ID Lookup API",
-    version="3.1",
+    version="4.0",
     description=(
-        "Fast Telegram account ID lookup using Parquet row-group statistics "
-        "and Hugging Face storage."
+        "Indexed Telegram account ID lookup using partitioned Parquet "
+        "shards on Hugging Face storage."
     ),
 )
 
-# Initialise the remote dataset once per process.
 fs = HfFileSystem(token=HF_TOKEN)
-DATA_FILES = sorted(fs.glob(f"{BUCKET}/data_*.parquet"))
 
-if not DATA_FILES:
-    raise RuntimeError(
-        f"No data_*.parquet files found in {BUCKET}. "
-        "Set HF_BUCKET to the correct Hugging Face bucket path."
+# The index manifest is published last by the build workflow. Its presence
+# means every shard listed in it has already been uploaded successfully.
+try:
+    with fs.open(INDEX_MANIFEST, "rb") as manifest_file:
+        INDEX_INFO = json.loads(manifest_file.read().decode("utf-8"))
+    INDEX_READY = (
+        INDEX_INFO.get("version") == 1
+        and int(INDEX_INFO.get("shard_count", 0)) == INDEX_SHARDS
+        and isinstance(INDEX_INFO.get("files"), dict)
     )
+except FileNotFoundError:
+    INDEX_INFO = {}
+    INDEX_READY = False
+except Exception:
+    logger.exception("Could not read the index manifest; using legacy scan.")
+    INDEX_INFO = {}
+    INDEX_READY = False
 
-dataset = ds.dataset(DATA_FILES, filesystem=fs, format="parquet")
-required_columns = {"account_id", "phone"}
-missing_columns = required_columns.difference(dataset.schema.names)
-if missing_columns:
-    raise RuntimeError(
-        "Parquet dataset is missing required columns: "
-        + ", ".join(sorted(missing_columns))
-    )
+DATA_FILES = []
+FRAGMENTS = []
+dataset = None
 
-FRAGMENTS = list(dataset.get_fragments())
+if not INDEX_READY:
+    DATA_FILES = sorted(fs.glob(f"{BUCKET}/data_*.parquet"))
+    if not DATA_FILES:
+        raise RuntimeError(
+            f"No index or data_*.parquet files found in {BUCKET}. "
+            "Check HF_BUCKET and Hugging Face permissions."
+        )
 
-# Load each file's Parquet metadata once at startup. The metadata contains
-# account_id min/max statistics for row-group pruning.
-for fragment in FRAGMENTS:
-    fragment.ensure_complete_metadata()
+    dataset = ds.dataset(DATA_FILES, filesystem=fs, format="parquet")
+    required_columns = {"account_id", "phone"}
+    missing_columns = required_columns.difference(dataset.schema.names)
+    if missing_columns:
+        raise RuntimeError(
+            "Parquet dataset is missing required columns: "
+            + ", ".join(sorted(missing_columns))
+        )
+
+    FRAGMENTS = list(dataset.get_fragments())
+    for fragment in FRAGMENTS:
+        fragment.ensure_complete_metadata()
 
 
 def _clean(value):
@@ -62,19 +85,42 @@ def _clean(value):
     return value
 
 
-def _scan_candidate_fragments(telegram_id):
-    filter_expr = ds.field("account_id") == telegram_id
+def _scan_index(telegram_id):
+    # account_id values are numeric strings in this dataset. The builder uses
+    # the same integer modulo operation to place every ID in one shard.
+    shard = str(int(telegram_id) % INDEX_SHARDS)
+    shard_files = INDEX_INFO["files"].get(shard)
+    if not shard_files:
+        return None
 
-    # First use row-group statistics only to identify which files can match.
-    # Do not create a separate remote scanner for every matching row group:
-    # that causes many repeated HTTP range requests to Hugging Face.
+    paths = [f"{BUCKET}/{path}" for path in shard_files]
+    indexed_dataset = ds.dataset(paths, filesystem=fs, format="parquet")
+    filter_expr = ds.field("account_id") == telegram_id
+    scanner = indexed_dataset.scanner(
+        filter=filter_expr,
+        columns=["account_id", "phone"],
+        batch_size=BATCH_SIZE,
+        use_threads=True,
+    )
+
+    for batch in scanner.to_batches():
+        for row in batch.to_pylist():
+            account_id = _clean(row.get("account_id"))
+            if account_id == telegram_id:
+                return {
+                    "account_id": account_id,
+                    "phone": _clean(row.get("phone")),
+                }
+    return None
+
+
+def _scan_legacy(telegram_id):
+    filter_expr = ds.field("account_id") == telegram_id
     candidate_files = []
     for fragment in FRAGMENTS:
         if fragment.split_by_row_group(filter=filter_expr):
             candidate_files.append(fragment)
 
-    # Scan each candidate Parquet file once. PyArrow applies the exact filter
-    # and row-group pruning internally while it reads the selected columns.
     for fragment in candidate_files:
         scanner = fragment.scanner(
             filter=filter_expr,
@@ -82,7 +128,6 @@ def _scan_candidate_fragments(telegram_id):
             batch_size=BATCH_SIZE,
             use_threads=True,
         )
-
         for batch in scanner.to_batches():
             for row in batch.to_pylist():
                 account_id = _clean(row.get("account_id"))
@@ -91,34 +136,34 @@ def _scan_candidate_fragments(telegram_id):
                         "account_id": account_id,
                         "phone": _clean(row.get("phone")),
                     }
-
     return None
 
 
 @lru_cache(maxsize=CACHE_SIZE)
 def _lookup_cached(telegram_id):
-    return _scan_candidate_fragments(telegram_id)
+    if INDEX_READY:
+        return _scan_index(telegram_id)
+    return _scan_legacy(telegram_id)
 
 
 def lookup_telegram_id(telegram_id):
     telegram_id = telegram_id.strip()
     if not telegram_id:
         raise HTTPException(status_code=400, detail="Telegram ID is required.")
+    if not telegram_id.isdigit():
+        raise HTTPException(status_code=400, detail="Telegram ID must contain digits only.")
 
     started = time.perf_counter()
-
     try:
         found = _lookup_cached(telegram_id)
     except Exception as exc:
-        # Keep the client response generic, but record the real cause in Vercel logs.
-        logger.exception("Parquet lookup failed (exception_type=%s)", type(exc).__name__)
+        logger.exception("Lookup failed (exception_type=%s)", type(exc).__name__)
         raise HTTPException(
             status_code=503,
-            detail="Database scan temporarily failed. Please retry.",
+            detail="Database lookup temporarily failed. Please retry.",
         ) from exc
 
     elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
-
     if not found:
         return {
             "status": "not_found",
@@ -142,8 +187,10 @@ def root():
         "status": "online",
         "developer": DEVELOPER,
         "endpoint": "/telegram?id=<telegram_id>",
-        "backend": "FastAPI + PyArrow row-group pruning + Hugging Face",
+        "backend": "FastAPI + indexed Parquet shards + Hugging Face",
+        "index_ready": INDEX_READY,
         "data_files": len(DATA_FILES),
+        "index_shards": INDEX_SHARDS if INDEX_READY else 0,
         "cache_size": CACHE_SIZE,
         "phone_output": "full",
         "api_version": app.version,
@@ -154,7 +201,7 @@ def root():
 def health():
     return {
         "status": "ok",
-        "developer": DEVELOPER,
+        "index_ready": INDEX_READY,
         "data_files": len(DATA_FILES),
     }
 
@@ -163,6 +210,8 @@ def health():
 def stats():
     cache = _lookup_cached.cache_info()
     return {
+        "index_ready": INDEX_READY,
+        "index_shards": INDEX_SHARDS if INDEX_READY else 0,
         "data_files": len(DATA_FILES),
         "cache_hits": cache.hits,
         "cache_misses": cache.misses,
