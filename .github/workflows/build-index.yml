@@ -1,0 +1,42 @@
+name: Build Telegram lookup index
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegramdb-index-build
+  cancel-in-progress: false
+
+jobs:
+  build-index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install index builder dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade "huggingface_hub>=0.32.0" pyarrow duckdb
+
+      - name: Build and upload indexed Parquet shards
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_BUCKET: buckets/Chatpataprani/Telegram-Cleaned-DB-bucket
+          INDEX_SHARDS: "1024"
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::HF_TOKEN repository secret is missing."
+            exit 1
+          fi
+          python scripts/build_index.py
