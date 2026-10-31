@@ -17,7 +17,7 @@ BATCH_SIZE = max(256, int(os.getenv("BATCH_SIZE", "4096")))
 
 app = FastAPI(
     title="Telegram ID Lookup API",
-    version="3.0",
+    version="3.1",
     description=(
         "Fast Telegram account ID lookup using Parquet row-group statistics "
         "and Hugging Face storage."
@@ -63,15 +63,17 @@ def _clean(value):
 def _scan_candidate_fragments(telegram_id):
     filter_expr = ds.field("account_id") == telegram_id
 
-    # This uses Parquet row-group statistics to discard row groups whose
-    # account_id min/max range cannot contain the requested ID.
-    candidates = []
+    # First use row-group statistics only to identify which files can match.
+    # Do not create a separate remote scanner for every matching row group:
+    # that causes many repeated HTTP range requests to Hugging Face.
+    candidate_files = []
     for fragment in FRAGMENTS:
-        candidates.extend(fragment.split_by_row_group(filter=filter_expr))
+        if next(fragment.split_by_row_group(filter=filter_expr), None) is not None:
+            candidate_files.append(fragment)
 
-    # Scan only candidate row groups. The exact filter remains enabled as
-    # a correctness check; PyArrow can also use its internal parallelism.
-    for fragment in candidates:
+    # Scan each candidate Parquet file once. PyArrow applies the exact filter
+    # and row-group pruning internally while it reads the selected columns.
+    for fragment in candidate_files:
         scanner = fragment.scanner(
             filter=filter_expr,
             columns=["account_id", "phone"],
