@@ -1,8 +1,6 @@
 import os
 import time
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Event
 
 import pyarrow.dataset as ds
 from fastapi import FastAPI, HTTPException, Query
@@ -14,16 +12,19 @@ BUCKET = os.getenv(
 )
 HF_TOKEN = os.getenv("HF_TOKEN") or None
 DEVELOPER = "chatpataprani"
-
-MAX_WORKERS = max(1, int(os.getenv("LOOKUP_WORKERS", "8")))
-CACHE_SIZE = max(1, int(os.getenv("CACHE_SIZE", "512")))
+CACHE_SIZE = max(1, int(os.getenv("CACHE_SIZE", "1024")))
+BATCH_SIZE = max(256, int(os.getenv("BATCH_SIZE", "4096")))
 
 app = FastAPI(
     title="Telegram ID Lookup API",
-    version="2.0",
-    description="Looks up Telegram account IDs in the configured Parquet dataset.",
+    version="3.0",
+    description=(
+        "Fast Telegram account ID lookup using Parquet row-group statistics "
+        "and Hugging Face storage."
+    ),
 )
 
+# Initialise the remote dataset once per process.
 fs = HfFileSystem(token=HF_TOKEN)
 DATA_FILES = sorted(fs.glob(f"{BUCKET}/data_*.parquet"))
 
@@ -44,6 +45,11 @@ if missing_columns:
 
 FRAGMENTS = list(dataset.get_fragments())
 
+# Load each file's Parquet metadata once at startup. The metadata contains
+# account_id min/max statistics for row-group pruning.
+for fragment in FRAGMENTS:
+    fragment.ensure_complete_metadata()
+
 
 def _clean(value):
     if value is None:
@@ -55,7 +61,7 @@ def _clean(value):
 
 
 def _mask_phone(value):
-    """Never return a complete phone number from this public lookup API."""
+    """Do not expose complete phone numbers through this public API."""
     value = _clean(value)
     if not value:
         return None
@@ -66,60 +72,40 @@ def _mask_phone(value):
     return "*" * (len(digits) - 2) + digits[-2:]
 
 
-def _scan_fragment(fragment, filter_expr, stop_event):
-    if stop_event.is_set():
-        return None
+def _scan_candidate_fragments(telegram_id):
+    filter_expr = ds.field("account_id") == telegram_id
 
-    try:
+    # This uses Parquet row-group statistics to discard row groups whose
+    # account_id min/max range cannot contain the requested ID.
+    candidates = []
+    for fragment in FRAGMENTS:
+        candidates.extend(fragment.split_by_row_group(filter=filter_expr))
+
+    # Scan only candidate row groups. The exact filter remains enabled as
+    # a correctness check; PyArrow can also use its internal parallelism.
+    for fragment in candidates:
         scanner = fragment.scanner(
             filter=filter_expr,
             columns=["account_id", "phone"],
-            batch_size=4096,
-            use_threads=False,
+            batch_size=BATCH_SIZE,
+            use_threads=True,
         )
+
         for batch in scanner.to_batches():
-            if stop_event.is_set():
-                return None
             for row in batch.to_pylist():
                 account_id = _clean(row.get("account_id"))
-                phone = _mask_phone(row.get("phone"))
-                if account_id:
-                    stop_event.set()
-                    return {"account_id": account_id, "phone": phone}
-    except Exception:
-        return None
+                if account_id == telegram_id:
+                    return {
+                        "account_id": account_id,
+                        "phone": _mask_phone(row.get("phone")),
+                    }
 
     return None
 
 
 @lru_cache(maxsize=CACHE_SIZE)
 def _lookup_cached(telegram_id):
-    stop_event = Event()
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-    futures = [
-        executor.submit(
-            _scan_fragment,
-            fragment,
-            ds.field("account_id") == telegram_id,
-            stop_event,
-        )
-        for fragment in FRAGMENTS
-    ]
-
-    try:
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                for pending in futures:
-                    pending.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
-                return result
-
-        executor.shutdown(wait=True)
-        return None
-    except Exception:
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
+    return _scan_candidate_fragments(telegram_id)
 
 
 def lookup_telegram_id(telegram_id):
@@ -128,13 +114,24 @@ def lookup_telegram_id(telegram_id):
         raise HTTPException(status_code=400, detail="Telegram ID is required.")
 
     started = time.perf_counter()
-    found = _lookup_cached(telegram_id)
+
+    try:
+        found = _lookup_cached(telegram_id)
+    except Exception as exc:
+        # Avoid silently turning storage/scan failures into false not_found.
+        raise HTTPException(
+            status_code=503,
+            detail="Database scan temporarily failed. Please retry.",
+        ) from exc
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
 
     if not found:
         return {
             "status": "not_found",
             "account_id": telegram_id,
             "developer": DEVELOPER,
+            "lookup_ms": elapsed_ms,
         }
 
     return {
@@ -142,7 +139,7 @@ def lookup_telegram_id(telegram_id):
         "account_id": found["account_id"],
         "phone": found["phone"],
         "developer": DEVELOPER,
-        "lookup_ms": round((time.perf_counter() - started) * 1000, 2),
+        "lookup_ms": elapsed_ms,
     }
 
 
@@ -152,11 +149,11 @@ def root():
         "status": "online",
         "developer": DEVELOPER,
         "endpoint": "/telegram?id=<telegram_id>",
-        "backend": "FastAPI + PyArrow + Hugging Face",
+        "backend": "FastAPI + PyArrow row-group pruning + Hugging Face",
         "data_files": len(DATA_FILES),
-        "lookup_workers": MAX_WORKERS,
         "cache_size": CACHE_SIZE,
         "phone_output": "masked",
+        "api_version": app.version,
     }
 
 
@@ -166,6 +163,18 @@ def health():
         "status": "ok",
         "developer": DEVELOPER,
         "data_files": len(DATA_FILES),
+    }
+
+
+@app.get("/stats")
+def stats():
+    cache = _lookup_cached.cache_info()
+    return {
+        "data_files": len(DATA_FILES),
+        "cache_hits": cache.hits,
+        "cache_misses": cache.misses,
+        "cache_entries": cache.currsize,
+        "cache_max_size": cache.maxsize,
     }
 
 
